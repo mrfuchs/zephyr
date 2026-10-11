@@ -38,6 +38,25 @@ static const uint32_t rx_desc_refresh_flags =
 
 #define ENET_QOS_TX_FLUSH_TIMEOUT_US 1000U
 
+static bool software_owns_descriptor(volatile union nxp_enet_qos_rx_desc *desc)
+{
+	return (desc->write.control3 & OWN_FLAG) != OWN_FLAG;
+}
+
+static void enet_qos_rx_desc_rearm(struct nxp_enet_qos_rx_data *rx, uint32_t idx)
+{
+	volatile union nxp_enet_qos_rx_desc *desc = &rx->descriptors[idx];
+
+	/* Restore the read format after DMA writeback, including context slots. */
+	desc->read.buf1_addr = (uint32_t)rx->reserved_bufs[idx]->data;
+	desc->read.reserved = 0U;
+	desc->read.buf2_addr = 0U;
+
+	/* Publish the buffer address before transferring ownership to DMA. */
+	barrier_dmem_fence_full();
+	desc->read.control = rx_desc_refresh_flags;
+}
+
 #if defined(CONFIG_PTP_CLOCK_NXP_ENET_QOS)
 #define RX_TIMESTAMP_CONTEXT_RETRIES        10U
 #define RX_TIMESTAMP_CONTEXT_RETRY_DELAY_US 1U
@@ -46,14 +65,12 @@ static bool rx_timestamp_descriptors_ready(volatile union nxp_enet_qos_rx_desc *
 					   volatile union nxp_enet_qos_rx_desc *ctx_desc)
 {
 	for (uint32_t retry = 0; retry <= RX_TIMESTAMP_CONTEXT_RETRIES; retry++) {
-		uint32_t context_status3 = ctx_desc->write.control3;
-
-		if (!(context_status3 & OWN_FLAG) &&
-		    (context_status3 & RECEIVE_CONTEXT_DESCRIPTOR_FLAG)) {
+		if (software_owns_descriptor(ctx_desc)) {
 			/* CTXT ownership transfer completes both descriptor writebacks. */
 			barrier_dmem_fence_full();
 
-			if ((desc->write.control3 & RX_STATUS1_VALID_FLAG) &&
+			if ((ctx_desc->write.control3 & RECEIVE_CONTEXT_DESCRIPTOR_FLAG) &&
+			    (desc->write.control3 & RX_STATUS1_VALID_FLAG) &&
 			    (desc->write.control1 & RX_TIMESTAMP_AVAILABLE_FLAG)) {
 				return true;
 			}
@@ -612,11 +629,6 @@ static enum ethernet_hw_caps eth_nxp_enet_qos_get_capabilities(const struct devi
 	return caps;
 }
 
-static bool software_owns_descriptor(volatile union nxp_enet_qos_rx_desc *desc)
-{
-	return (desc->write.control3 & OWN_FLAG) != OWN_FLAG;
-}
-
 /* this function resumes the rx dma in case of underrun */
 static void enet_qos_dma_rx_resume(const struct device *dev)
 {
@@ -635,6 +647,8 @@ static void enet_qos_dma_rx_resume(const struct device *dev)
 	/* We need to just touch the tail ptr to make sure it resumes if underrun happened.
 	 * Then it will resume if there are DMA owned descriptors queued up in the ring properly.
 	 */
+	/* Complete all rearmed descriptors before waking the suspended DMA. */
+	barrier_dsync_fence_full();
 	base->DMA_CH[0].DMA_CHX_RXDESC_TAIL_PTR = ENET_QOS_REG_PREP(
 		DMA_CH_DMA_CHX_RXDESC_TAIL_PTR, RDTP,
 		ENET_QOS_ALIGN_ADDR_SHIFT((uint32_t)&rx_data->descriptors[NUM_RX_BUFDESC]));
@@ -663,6 +677,9 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 	 * DMA can use them for receiving again. We stop when we reach DMA owned part of ring.
 	 */
 	while (software_owns_descriptor(desc)) {
+		/* DMA clears OWN after writing status and payload. */
+		barrier_dmem_fence_full();
+
 		rx_data->next_desc_idx = (desc_idx + 1U) % NUM_RX_BUFDESC;
 
 		if (pkt == NULL) {
@@ -676,9 +693,7 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 				 * address in read format, so restore it before handing
 				 * the descriptor back to the DMA.
 				 */
-				desc->read.buf1_addr =
-					(uint32_t)data->rx.reserved_bufs[desc_idx]->data;
-				desc->read.control = rx_desc_refresh_flags;
+				enet_qos_rx_desc_rearm(rx_data, desc_idx);
 				goto next;
 			}
 
@@ -688,9 +703,7 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 			if (!pkt) {
 				LOG_WRN("Could not alloc new RX pkt");
 				/* error: no new buffer, reuse previous immediately */
-				desc->read.buf1_addr =
-					(uint32_t)data->rx.reserved_bufs[desc_idx]->data;
-				desc->read.control = rx_desc_refresh_flags;
+				enet_qos_rx_desc_rearm(rx_data, desc_idx);
 				eth_stats_update_errors_rx(data->iface);
 				goto next;
 			}
@@ -713,8 +726,7 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 				pkt_len, processed_len);
 			net_pkt_unref(pkt);
 			pkt = NULL;
-			desc->read.buf1_addr = (uint32_t)data->rx.reserved_bufs[desc_idx]->data;
-			desc->read.control = rx_desc_refresh_flags;
+			enet_qos_rx_desc_rearm(rx_data, desc_idx);
 			eth_stats_update_errors_rx(data->iface);
 			goto next;
 		}
@@ -734,8 +746,7 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 			LOG_WRN("No new RX buf available");
 			net_pkt_unref(pkt);
 			pkt = NULL;
-			desc->read.buf1_addr = (uint32_t)data->rx.reserved_bufs[desc_idx]->data;
-			desc->read.control = rx_desc_refresh_flags;
+			enet_qos_rx_desc_rearm(rx_data, desc_idx);
 			eth_stats_update_errors_rx(data->iface);
 			goto next;
 		}
@@ -772,9 +783,7 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 					 * regular RX descriptor - the reserved_buf at
 					 * this index was untouched by the context write.
 					 */
-					ctx_desc->read.buf1_addr =
-						(uint32_t)data->rx.reserved_bufs[ctx_idx]->data;
-					ctx_desc->read.control = rx_desc_refresh_flags;
+					enet_qos_rx_desc_rearm(rx_data, ctx_idx);
 					rx_data->next_desc_idx = (ctx_idx + 1U) % NUM_RX_BUFDESC;
 				}
 			}
@@ -808,8 +817,7 @@ static void eth_nxp_enet_qos_rx(struct k_work *work)
 		LOG_DBG("Swap RX buf %p for %p", data->rx.reserved_bufs[desc_idx], new_buf);
 		/* Allow receive into a new buffer */
 		data->rx.reserved_bufs[desc_idx] = new_buf;
-		desc->read.buf1_addr = (uint32_t)new_buf->data;
-		desc->read.control = rx_desc_refresh_flags;
+		enet_qos_rx_desc_rearm(rx_data, desc_idx);
 
 next:
 		desc_idx = rx_data->next_desc_idx;
@@ -1094,12 +1102,14 @@ static inline int enet_qos_rx_desc_init(enet_qos_t *base, struct nxp_enet_qos_rx
 			return -ENOMEM;
 		}
 		rx->reserved_bufs[i] = buf;
-		rx->descriptors[i].read.buf1_addr = (uint32_t)buf->data;
-		rx->descriptors[i].read.control |= rx_desc_refresh_flags;
+		enet_qos_rx_desc_rearm(rx, i);
 	}
 
 	/* Set next descriptor where data will be received */
 	rx->next_desc_idx = 0U;
+
+	/* Complete descriptor publication before the tail pointer and DMA start. */
+	barrier_dsync_fence_full();
 
 	/* Set up RX descriptors on channel 0 */
 	base->DMA_CH[0].DMA_CHX_RXDESC_LIST_ADDR =
